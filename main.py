@@ -13,9 +13,9 @@ import utils
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-class NoisySwissRollDataset(data.Dataset):
+class SwissRollDataset(data.Dataset):
     def __init__(self, betas, n_schedule_steps, n_states):
-        self.n_samples = 500_000
+        self.n_samples = 1_000_000
         self.betas = betas
         self.n_schedule_steps = n_schedule_steps
         self.n_states = n_states
@@ -68,20 +68,19 @@ class DiffusionModel(nn.Module):
 class SwissRollDiffusion():
     def __init__(self):
         self.n_schedule_steps = 100  # number of steps for the diffusion process
-        self.n_epochs = 1  # number of epochs for training
+        self.n_epochs = 2  # number of epochs for training
         self.n_states = 256  # number of states for the swiss roll data
         self.n_features = 2  # number of features (e.g. x and y coordinate)
         self.absorbing_idx = self.n_states  # index of the absorbing state
         self.betas = utils.get_diffusion_betas({'type': 'jsd', 'num_timesteps': self.n_schedule_steps})
         self.eps = 1e-6  # small value to avoid division by zero
-        self.noisy_dataset = NoisySwissRollDataset(self.betas, self.n_schedule_steps, self.n_states)
-        self.dataset_loader = torch.utils.data.DataLoader(self.noisy_dataset, batch_size=128, shuffle=True)
+        self.noisy_dataset = SwissRollDataset(self.betas, self.n_schedule_steps, self.n_states)
+        self.dataset_loader = torch.utils.data.DataLoader(self.noisy_dataset, batch_size=512, shuffle=True)
 
         # Initialize the one-step and cumulative transition matrices
         self.q_one_step_mats = self.init_transition_matrices()
         self.q_cum_mats = self.init_cum_transition_matrices()
         self.model = DiffusionModel(self.n_features, self.n_states, self.n_schedule_steps).to(device)
-
 
     def train(self):
         optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
@@ -186,36 +185,41 @@ class SwissRollDiffusion():
         Returns:
             logits: Tensor of shape (batch_size, n_states + 1) representing the logits of the posterior distribution.
         """
+        # if x_start_logits:
+        #     assert x_start.shape == x_t.shape + (self.n_states + 1,)
+        #     # x_start is logits, convert to probabilities for computation
+        #     x_start_probs = F.softmax(x_start, dim=-1)  # (B, D + 1), D = n_states
+        #     # self.q_cum_mats[t-1]  (D + 1, D + 1)
+        #     # x @ Q = (Q @ x^T)^T  (D + 1, B) ^ T = (B, D + 1)
+        #     # fact2 = torch.matmul(self.q_cum_mats[t-1], x_start_probs.transpose(0, 1)).transpose(0, 1)
+        #     fact2 = torch.matmul(x_start_probs, self.q_cum_mats[t-1])
+        #     tzero_logits = x_start  # Directly use logits if x_start is logits
+        # else:
+        #     assert x_start.shape == x_t.shape, f"Shapes do not match: {x_start.shape}, {x_t.shape}"
+        #     # x_start is indices, convert to one-hot for computation
+        #     x_start_one_hot = F.one_hot(x_start, num_classes=self.n_states + 1)  # (B, D + 1)
+        #     # fact2 = torch.matmul(self.q_cum_mats[t-1], x_start_one_hot.float().transpose(0, 1)).transpose(0, 1)
+        #     fact2 = torch.matmul(x_start_one_hot.float(), self.q_cum_mats[t-1])  # (128, 2, 257) @ (128, 257, 257) = (128, 2, 257)
+        #     tzero_logits = torch.log(x_start_one_hot.float() + self.eps)  # Convert one-hot to log probabilities
+
         if x_start_logits:
             assert x_start.shape == x_t.shape + (self.n_states + 1,)
-            # x_start is logits, convert to probabilities for computation
-            x_start_probs = F.softmax(x_start, dim=-1)  # (B, D + 1), D = n_states
-            # self.q_cum_mats[t-1]  (D + 1, D + 1)
-            # x @ Q = (Q @ x^T)^T  (D + 1, B) ^ T = (B, D + 1)
-            # fact2 = torch.matmul(self.q_cum_mats[t-1], x_start_probs.transpose(0, 1)).transpose(0, 1)
-            fact2 = torch.matmul(x_start_probs, self.q_cum_mats[t-1])
-            tzero_logits = x_start  # Directly use logits if x_start is logits
+            fact2 = self._at_onehot(self.q_cum_mats, t-1, F.softmax(x_start, dim=-1))
+            tzero_logits = x_start
         else:
             assert x_start.shape == x_t.shape, f"Shapes do not match: {x_start.shape}, {x_t.shape}"
-            # x_start is indices, convert to one-hot for computation
-            x_start_one_hot = F.one_hot(x_start, num_classes=self.n_states + 1)  # (B, D + 1)
-            # fact2 = torch.matmul(self.q_cum_mats[t-1], x_start_one_hot.float().transpose(0, 1)).transpose(0, 1)
-            fact2 = torch.matmul(x_start_one_hot.float(), self.q_cum_mats[t-1])  # (128, 2, 257) @ (128, 257, 257) = (128, 2, 257)
-            tzero_logits = torch.log(x_start_one_hot.float() + self.eps)  # Convert one-hot to log probabilities
+            # print(f"Shapes: x_start={x_start.shape}, x_t={x_t.shape}")
+            fact2 = self._at(self.q_cum_mats, t-1, x_start)
+            tzero_logits = torch.log(F.one_hot(x_start, num_classes=self.n_states + 1) + self.eps)
 
-        # Extract probabilities for x_t from transpose of one-step matrices
-        # q_one_step_mats (T, D, D)
-        # q_one_step_mats[t] (D, D)
-        # x_t (B, D) where D is n_states + 1
-        # fact1 is complicated because we are conditioning on x_
-        # Use advanced indexing to pull out the timestep t and 
-        # fact1 = self.q_one_step_mats.transpose(0, 2, 1)[t, x_t]  # (B, D + 1)
         fact1 = self._at(torch.transpose(self.q_one_step_mats, 2, 1), t, x_t)  # (B, F, D + 1)
-
-        print(f"fact1: {fact1[0][0][:]}")
-        print(f"fact2: {fact2[0][0][:]}")
-
         out = torch.log(fact1 + self.eps) + torch.log(fact2 + self.eps)
+
+        # print(f"x_start_logits: {x_start_logits}")
+        # print(f"fact1: {fact1[0][0][:]}")
+        # print(f"fact2: {fact2[0][0][:]}")
+        # print(f"out: {out[0][0][:]}")
+
         t_broadcast = t.unsqueeze(1).unsqueeze(2).expand(-1, *out.shape[1:])
         return torch.where(t_broadcast == 0, tzero_logits, out)
 
@@ -282,7 +286,22 @@ class SwissRollDiffusion():
         t_broadcast = t.unsqueeze(1).expand(-1, *x.shape[1:])
         return a[t_broadcast, x]
 
-    def p_sample(self, x, t):
+    def _at_onehot(self, a, t, x):
+        """Extract coefficients at specified timesteps t and conditioning data x.
+
+        Args:
+        a: np.ndarray: plain NumPy float64 array of constants indexed by time.
+        t: jnp.ndarray: Jax array of time indices, shape = (bs,).
+        x: jnp.ndarray: jax array, shape (bs, ..., num_pixel_vals), float32 type.
+            (Noisy) data. Should be of one-hot-type representation.
+
+        Returns:
+        out: jnp.ndarray: Jax array. output of dot(x, a[t], axis=[[-1], [1]]).
+            shape = (bs, ..., num_pixel_vals)
+        """
+        return torch.matmul(x, a[t])
+
+    def p_sample(self, x, t, tau=0.1, tau_nonzero=1.0):
         """Sample one timestep from the model p(x_{t-1} | x_t) using PyTorch."""
         # Compute the logits for the current state x at time t
         pred_logits = self.p_logits(x, t)  # Assuming p_logits returns logits of shape (batch_size, num_features, num_states + 1)
@@ -293,13 +312,17 @@ class SwissRollDiffusion():
         # create a mask to handle the no-noise condition when t == 0
         nonzero_mask = (t > 0).float().unsqueeze(-1).unsqueeze(-1)  # reshape to (batch_size, 1, 1) for broadcasting
 
-        # use the straight-through gumbel-softmax estimator for sampling
-        gumbel_noise = -torch.log(-torch.log(torch.rand_like(pred_logits)))  # gumbel noise
+        # Apply softmax with a low temperature for t=0, and a higher temperature for t>0
+        temperatures = torch.full_like(t, tau_nonzero, dtype=torch.float32).unsqueeze(-1).unsqueeze(-1)
+        temperatures[nonzero_mask == 0] = tau  # Set a lower temperature for t=0
 
-        # for t == 0, use argmax; otherwise, apply gumbel noise
-        # sampled_logits = torch.where(nonzero_mask.expand_as(pred_logits) > 0, pred_logits + gumbel_noise, pred_logits)
-        sampled_logits = torch.where(nonzero_mask.expand_as(pred_logits) > 0, pred_logits + gumbel_noise, pred_logits + gumbel_noise)
-        sample = torch.argmax(sampled_logits, dim=-1)
+        # Calculate the softmax over the logits, scaled by the temperature
+        # pred_logits / temperatures adjusts logits according to the temperature
+        probs = F.softmax(pred_logits / temperatures, dim=-1)
+
+        # Sample from the categorical distribution based on the computed probabilities
+        # torch.multinomial to sample from the categorical distribution described by probs
+        sample = torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(probs.shape[:-1])
 
         return sample
 
