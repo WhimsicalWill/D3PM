@@ -63,7 +63,7 @@ def categorical_log_likelihood(x, logits):
     Returns:
         log likelihoods
     """
-    log_probs = F.log_softmax(logits)
+    log_probs = F.log_softmax(logits, dim=-1)
     x_onehot = F.one_hot(x, logits.shape[-1])
     return torch.sum(log_probs * x_onehot, dim=-1)
 

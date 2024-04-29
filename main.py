@@ -15,7 +15,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class SwissRollDataset(data.Dataset):
     def __init__(self, betas, n_schedule_steps, n_states):
-        self.n_samples = 1_000_000
+        self.n_samples = 5_000_000
         self.betas = betas
         self.n_schedule_steps = n_schedule_steps
         self.n_states = n_states
@@ -43,26 +43,29 @@ class SwissRollDataset(data.Dataset):
 class DiffusionModel(nn.Module):
     def __init__(self, n_features, n_states, n_schedule_steps):
         super(DiffusionModel, self).__init__()
-        # A simple network with two hidden layers and ReLU activations
         self.n_hidden = 128
         self.n_features = n_features
         self.n_states = n_states
         self.n_schedule_steps = n_schedule_steps
         self.network = nn.Sequential(
-            nn.Linear(3, self.n_hidden),  # 2 features + 1 for time embedding
-            nn.ReLU(),
+            nn.Linear(3, self.n_hidden),
+            nn.LeakyReLU(0.01),
+            nn.Dropout(0.2),
             nn.Linear(self.n_hidden, self.n_hidden),
-            nn.ReLU(),
-            nn.Linear(self.n_hidden, n_features * (n_states + 1))  # Output logits for all features
+            nn.LeakyReLU(0.01),
+            nn.Dropout(0.2),
+            nn.Linear(self.n_hidden, self.n_hidden),
+            nn.LeakyReLU(0.01),
+            nn.Linear(self.n_hidden, n_features * (n_states + 1))
         )
-    
+
     def forward(self, x, t):
-        t = t.float() / self.n_schedule_steps  # Normalize timesteps
-        t_embed = t.view(-1, 1)  # Reshape t to have the correct shape (batch_size, 1)
-        x = torch.cat([x.float(), t_embed], dim=1)
+        t = t.float() / self.n_schedule_steps
+        t_embed = t.view(-1, 1)
+        x = x.float() / self.n_states
+        x = torch.cat([x, t_embed], dim=1)
         logits = self.network(x)
-        # Reshape logits to have separate outputs for each feature
-        return logits.view(-1, self.n_features, self.n_states + 1)  # (B, F, D + 1)
+        return logits.view(-1, self.n_features, self.n_states + 1)
 
 
 class SwissRollDiffusion():
@@ -214,12 +217,6 @@ class SwissRollDiffusion():
 
         fact1 = self._at(torch.transpose(self.q_one_step_mats, 2, 1), t, x_t)  # (B, F, D + 1)
         out = torch.log(fact1 + self.eps) + torch.log(fact2 + self.eps)
-
-        # print(f"x_start_logits: {x_start_logits}")
-        # print(f"fact1: {fact1[0][0][:]}")
-        # print(f"fact2: {fact2[0][0][:]}")
-        # print(f"out: {out[0][0][:]}")
-
         t_broadcast = t.unsqueeze(1).unsqueeze(2).expand(-1, *out.shape[1:])
         return torch.where(t_broadcast == 0, tzero_logits, out)
 
@@ -227,9 +224,6 @@ class SwissRollDiffusion():
         """Compute logits of p(x_{t-1} | x_t)."""
         assert t.shape == (x.shape[0],)
         pred_logits = self.model(x, t)  # (B, F, D + 1)
-
-        # print(f"Before prediction: x0 = {x[0][0]}")
-        # print(f"After1 prediction: x0 = {pred_logits[0][0][:5]}")
 
         # Predict the logits of p(x_{t-1}|x_t) by parameterizing this distribution
         # as ~ sum_{pred_x_start} q(x_{t-1}, x_t |pred_x_start)p(pred_x_start|x_t)
@@ -240,8 +234,6 @@ class SwissRollDiffusion():
                                 self.q_posterior_logits(pred_logits, x,
                                                         t, x_start_logits=True)
                                 )
-
-        # print(f"After2 prediction: x0 = {pred_logits[0][0][:5]}")
 
         assert pred_logits.shape == x.shape + (self.n_states + 1,)
         return pred_logits
@@ -282,7 +274,6 @@ class SwissRollDiffusion():
         Returns:
         a[t, x]: jnp.ndarray: Jax array.
         """
-        # t_broadcast = np.expand_dims(t, tuple(range(1, x.ndim)))
         t_broadcast = t.unsqueeze(1).expand(-1, *x.shape[1:])
         return a[t_broadcast, x]
 
@@ -301,15 +292,11 @@ class SwissRollDiffusion():
         """
         return torch.matmul(x, a[t])
 
-    def p_sample(self, x, t, tau=0.1, tau_nonzero=1.0):
+    def p_sample(self, x, t, tau=0.5, tau_nonzero=1.0):
         """Sample one timestep from the model p(x_{t-1} | x_t) using PyTorch."""
-        # Compute the logits for the current state x at time t
-        pred_logits = self.p_logits(x, t)  # Assuming p_logits returns logits of shape (batch_size, num_features, num_states + 1)
+        pred_logits = self.p_logits(x, t)
 
-        # print the last 5 logits of the x coordinate for x0
-        # print(pred_logits[0][0][-5:])
-
-        # create a mask to handle the no-noise condition when t == 0
+        # create a mask to handle the low-noise condition when t == 0
         nonzero_mask = (t > 0).float().unsqueeze(-1).unsqueeze(-1)  # reshape to (batch_size, 1, 1) for broadcasting
 
         # Apply softmax with a low temperature for t=0, and a higher temperature for t>0
@@ -342,7 +329,6 @@ class SwissRollDiffusion():
 
             # Sample the previous state given the current state x at time t
             x = self.p_sample(x, t_tensor)  # Update x for each timestep
-            # print(f"timestep={t}, x0 = {x[0]}")
 
             if t in step_indices:
                 snapshots.append(x.clone().detach())  # Clone and detach to avoid modifications
@@ -362,7 +348,6 @@ class SwissRollDiffusion():
 if __name__ == "__main__":
     swiss_roll_diffusion = SwissRollDiffusion()
     swiss_roll_diffusion.train()
-    # swiss_roll_diffusion.visualize_noising_process()
 
     # Sample new data points
     snapshots = swiss_roll_diffusion.sample_reverse(num_samples=500, vis_steps=5)
