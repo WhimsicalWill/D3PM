@@ -32,21 +32,24 @@ def get_diffusion_betas(spec):
     else:
         raise NotImplementedError(spec['type'])
 
-def categorical_kl_probs(probs1, probs2, eps=1e-6):
+def categorical_kl_logits(logits1, logits2, eps=1.e-6):
     """KL divergence between categorical distributions.
 
     Distributions parameterized by logits.
 
     Args:
-        probs1: probs of the first distribution. Last dim is class dim.
-        probs2: probs of the second distribution. Last dim is class dim.
+        logits1: logits of the first distribution. Last dim is class dim.
+        logits2: logits of the second distribution. Last dim is class dim.
         eps: float small number to avoid numerical issues.
 
     Returns:
-        KL(C(probs) || C(logits2)): shape: logits1.shape[:-1]
+        KL(C(logits1) || C(logits2)): shape: logits1.shape[:-1]
     """
-    out = probs1 * (np.log(probs1 + eps) - np.log(probs2 + eps))
-    return np.sum(out, axis=-1)
+    out = (
+        F.softmax(logits1 + eps, dim=-1) *
+        (F.log_softmax(logits1 + eps, dim=-1) -
+         F.log_softmax(logits2 + eps, dim=-1)))
+    return torch.sum(out, dim=-1)
 
 def categorical_log_likelihood(x, logits):
     """Log likelihood of a discretized Gaussian specialized for image data.
@@ -62,7 +65,7 @@ def categorical_log_likelihood(x, logits):
     """
     log_probs = F.log_softmax(logits)
     x_onehot = F.one_hot(x, logits.shape[-1])
-    return np.sum(log_probs * x_onehot, axis=-1)
+    return torch.sum(log_probs * x_onehot, dim=-1)
 
 def meanflat(x):
     """Take the mean over all axes except the first batch dimension."""

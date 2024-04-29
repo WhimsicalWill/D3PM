@@ -29,19 +29,10 @@ class NoisySwissRollDataset(data.Dataset):
         data = np.floor(data * self.n_states)  # Quantize to 256 bins
         return torch.Tensor(data).long()
 
-    # def apply_noising(self, data_point, t):
-    #     noise_level = self.betas[t]
-    #     noisy_data = data_point.clone().detach()
-    #     noisy_data += (torch.rand(2) < noise_level).long() * (self.absorbing_idx - noisy_data)
-    #     return noisy_data
-
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        # t = torch.randint(0, self.n_schedule_steps, (1,)).item()
-        # data_point = self.data[idx]
-        # return self.apply_noising(data_point, t), t
         return self.data[idx]
 
 
@@ -50,6 +41,8 @@ class DiffusionModel(nn.Module):
         super(DiffusionModel, self).__init__()
         # A simple network with two hidden layers and ReLU activations
         self.n_hidden = 128
+        self.n_features = n_features
+        self.n_states = n_states
         self.n_schedule_steps = n_schedule_steps
         self.network = nn.Sequential(
             nn.Linear(3, self.n_hidden),  # 2 features + 1 for time embedding
@@ -63,7 +56,9 @@ class DiffusionModel(nn.Module):
         t = t.float() / self.n_schedule_steps  # Normalize timesteps
         t_embed = t.view(-1, 1)  # Reshape t to have the correct shape (batch_size, 1)
         x = torch.cat([x.float(), t_embed], dim=1)
-        return self.network(x)
+        logits = self.network(x)
+        # Reshape logits to have separate outputs for each feature
+        return logits.view(-1, self.n_features, self.n_states + 1)  # (B, F, D + 1)
 
 
 class SwissRollDiffusion():
@@ -86,14 +81,14 @@ class SwissRollDiffusion():
 
     def train(self):
         optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
-        criterion = nn.CrossEntropyLoss()  # Assumes classification task for states
         self.model.train()
         
         for epoch in range(self.n_epochs):
             for i, x_start in enumerate(self.dataset_loader):
-                noise = torch.rand(x_start.shape + (self.n_states + 1,))
-                t = torch.randint(0, self.n_schedule_steps, (x_start.shape[0],))
-                x_t = self.q_sample(x_start, t, noise)
+                # x_start has shape (B, F)
+                noise = torch.rand(x_start.shape + (self.n_states + 1,))  # (B, F, D + 1)
+                t = torch.randint(0, self.n_schedule_steps, (x_start.shape[0],))  # (B,)
+                x_t = self.q_sample(x_start, t, noise)  # (B, F)
 
                 optimizer.zero_grad()
                 loss = self.compute_loss(x_start, x_t, t)
@@ -138,7 +133,7 @@ class SwissRollDiffusion():
         logits = np.log(self.q_probs(x_start, t) + self.eps)
 
         # To avoid numerical issues clip the noise to a minimum value
-        noise = np.clip(noise, a_min=np.finfo(noise.dtype).tiny, a_max=1.)
+        noise = np.clip(noise, a_min=1e-6, a_max=1.)
         gumbel_noise = - np.log(-np.log(noise))
         return np.argmax(logits + gumbel_noise, axis=-1)
 
@@ -155,9 +150,9 @@ class SwissRollDiffusion():
             probs: jnp.ndarray: jax array, shape (bs, x_start.shape[1:],
                                                     num_pixel_vals).
         """
-        return self.q_cum_mats[t, x_start]
+        return self._at(self.q_cum_mats, t, x_start)
 
-    def q_posterior_logits(self, x_t, t, x_start, x_start_logits):
+    def q_posterior_logits(self, x_start, x_t, t, x_start_logits):
         """
         TODO: fix indexing of x_t (needs to be int or long)
         TODO: make sure that fact2 is correct (not using _at_onehot?)
@@ -170,28 +165,28 @@ class SwissRollDiffusion():
         see: https://beckham.nz/2022/07/11/d3pms.html#outline-container-org36077cc
 
         Args:
+            x_start: Tensor of shape (batch_size, n_states + 1) or (batch_size,) representing the starting distribution.
             x_t: Tensor of shape (batch_size,) representing the noisy data at time t.
             t: Tensor of shape (batch_size,) representing the timestep.
-            x_start: Tensor of shape (batch_size, n_states + 1) or (batch_size,) representing the starting distribution.
             x_start_logits: Boolean indicating whether x_start is the predicted logits or the indices.
         Returns:
             logits: Tensor of shape (batch_size, n_states + 1) representing the logits of the posterior distribution.
         """
-        assert x_t.shape == (x_t.shape[0], self.n_states + 1)
-        assert t.shape == (x_t.shape[0],)
         if x_start_logits:
             assert x_start.shape == x_t.shape + (self.n_states + 1,)
             # x_start is logits, convert to probabilities for computation
             x_start_probs = F.softmax(x_start, dim=-1)  # (B, D + 1), D = n_states
             # self.q_cum_mats[t-1]  (D + 1, D + 1)
             # x @ Q = (Q @ x^T)^T  (D + 1, B) ^ T = (B, D + 1)
-            fact2 = torch.matmul(self.q_cum_mats[t-1], x_start_probs.transpose(0, 1)).transpose(0, 1)
+            # fact2 = torch.matmul(self.q_cum_mats[t-1], x_start_probs.transpose(0, 1)).transpose(0, 1)
+            fact2 = torch.matmul(x_start_probs, self.q_cum_mats[t-1])
             tzero_logits = x_start  # Directly use logits if x_start is logits
         else:
-            assert x_start.shape == x_t.shape
+            assert x_start.shape == x_t.shape, f"Shapes do not match: {x_start.shape}, {x_t.shape}"
             # x_start is indices, convert to one-hot for computation
             x_start_one_hot = F.one_hot(x_start, num_classes=self.n_states + 1)  # (B, D + 1)
-            fact2 = torch.matmul(self.q_cum_mats[t-1], x_start_one_hot.float().transpose(0, 1)).transpose(0, 1)
+            # fact2 = torch.matmul(self.q_cum_mats[t-1], x_start_one_hot.float().transpose(0, 1)).transpose(0, 1)
+            fact2 = torch.matmul(x_start_one_hot.float(), self.q_cum_mats[t-1])  # (128, 2, 257) @ (128, 257, 257) = (128, 2, 257)
             tzero_logits = torch.log(x_start_one_hot.float() + self.eps)  # Convert one-hot to log probabilities
 
         # Extract probabilities for x_t from transpose of one-step matrices
@@ -200,32 +195,42 @@ class SwissRollDiffusion():
         # x_t (B, D) where D is n_states + 1
         # fact1 is complicated because we are conditioning on x_
         # Use advanced indexing to pull out the timestep t and 
-        fact1 = self.q_one_step_mats.transpose(0, 2, 1)[t, x_t]  # (B, D + 1)
+        # fact1 = self.q_one_step_mats.transpose(0, 2, 1)[t, x_t]  # (B, D + 1)
+        fact1 = self._at(torch.transpose(self.q_one_step_mats, 2, 1), t, x_t)  # (B, F, D + 1)
 
         out = torch.log(fact1 + self.eps) + torch.log(fact2 + self.eps)
-        t_broadcast = t.unsqueeze(1).expand_as(out)
+        t_broadcast = t.unsqueeze(1).unsqueeze(2).expand(-1, *out.shape[1:])
         return torch.where(t_broadcast == 0, tzero_logits, out)
 
     def p_logits(self, x, t):
         """Compute logits of p(x_{t-1} | x_t)."""
         assert t.shape == (x.shape[0],)
-        pred_logits = self.model(x, t)
+        pred_logits = self.model(x, t)  # (B, F, D + 1)
 
         # Predict the logits of p(x_{t-1}|x_t) by parameterizing this distribution
         # as ~ sum_{pred_x_start} q(x_{t-1}, x_t |pred_x_start)p(pred_x_start|x_t)
-        t_broadcast = np.expand_dims(t, tuple(range(1, pred_logits.ndim)))
-        pred_logits = np.where(t_broadcast == 0,
+        # TODO: clean up t_broadcast operations through a nicer operation like np.expand_dims()
+        t_broadcast = t.unsqueeze(1).unsqueeze(2).expand(-1, *pred_logits.shape[1:])
+        pred_logits = torch.where(t_broadcast == 0,
                                 pred_logits,
                                 self.q_posterior_logits(pred_logits, x,
                                                         t, x_start_logits=True)
                                 )
 
-        assert (pred_logits.shape == x.shape + (self.n_states + 1,))
+        assert pred_logits.shape == x.shape + (self.n_states + 1,)
         return pred_logits
 
     def compute_loss(self, x_start, x_t, t):
+        """Computes the loss using KL divergence between the true and predicted distributions.
+        
+        Args:
+            x_start: Tensor of shape (batch_size,) representing the clean data.
+            x_t: Tensor of shape (batch_size,) representing the noisy data.
+            t: Tensor of shape (batch_size,) representing the timestep.
+        """
+        assert x_start.shape == x_t.shape, f"Shapes do not match: {x_start.shape}, {x_t.shape}"
         true_logits = self.q_posterior_logits(x_start, x_t, t, x_start_logits=False)
-        pred_logits, pred_x_start_logits = self.p_logits(x=x_t, t=t)
+        pred_logits = self.p_logits(x=x_t, t=t)
 
         kl = utils.categorical_kl_logits(logits1=true_logits, logits2=pred_logits)
         assert kl.shape == x_start.shape
@@ -237,6 +242,22 @@ class SwissRollDiffusion():
 
         loss = torch.where(t == 0, decoder_nll, kl)  # (B,)
         return loss.mean()  # scalar
+
+    def _at(self, a, t, x):
+        """Extract coefficients at specified timesteps t and conditioning data x.
+
+        Args:
+        a: np.ndarray: plain NumPy float64 array of constants indexed by time.
+        t: jnp.ndarray: Jax array of time indices, shape = (batch_size,).
+        x: jnp.ndarray: jax array of shape (bs, ...) of int32 or int64 type.
+            (Noisy) data. Should not be of one hot representation, but have integer
+            values representing the class values.
+
+        Returns:
+        a[t, x]: jnp.ndarray: Jax array.
+        """
+        t_broadcast = np.expand_dims(t, tuple(range(1, x.ndim)))
+        return a[t_broadcast, x]
 
     def visualize_noising_process(self):
         dataset = NoisySwissRollDataset(self.betas, self.n_schedule_steps, self.n_states)
