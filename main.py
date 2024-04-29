@@ -82,32 +82,21 @@ class SwissRollDiffusion():
         # Initialize the one-step and cumulative transition matrices
         self.q_one_step_mats = self.init_transition_matrices()
         self.q_cum_mats = self.init_cum_transition_matrices()
+        self.model = DiffusionModel(self.n_features, self.n_states, self.n_schedule_steps)
 
     def train(self):
-        model = DiffusionModel(self.n_features, self.n_states, self.n_schedule_steps)
-        optimizer = optim.Adam(model.parameters(), lr=1e-3)
+        optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
         criterion = nn.CrossEntropyLoss()  # Assumes classification task for states
-        model.train()
+        self.model.train()
         
         for epoch in range(self.n_epochs):
-            for i, (x_start, t) in enumerate(self.dataset_loader):
+            for i, x_start in enumerate(self.dataset_loader):
+                noise = torch.rand(x_start.shape + (self.n_states + 1,))
+                t = torch.randint(0, self.n_schedule_steps, (x_start.shape[0],))
+                x_t = self.q_sample(x_start, t, noise)
+
                 optimizer.zero_grad()
-                predictions = model(noisy_data, timesteps)
-                
-                # Split predictions into separate parts for x and y
-                predictions_x = predictions[:, :(self.n_states + 1)]
-                predictions_y = predictions[:, (self.n_states + 1):]
-                
-                # Assume the targets are the original x and y indices
-                loss_x = criterion(predictions_x, noisy_data[:, 0].long())  # Target for x
-                loss_y = criterion(predictions_y, noisy_data[:, 1].long())  # Target for y
-
-                true_logits_x = self.q_posterior_logits(..., noisy_data[:, 0].long, timesteps, x_start)  # Need to pass correct params
-                true_logits_y = self.q_posterior_logits(..., noisy_data[:, 1].long, timesteps, x_start)  # Need to pass correct params
-                loss_x = compute_kl_divergence(predictions_x, true_logits_x)
-                loss_y = compute_kl_divergence(predictions_y, true_logits_y)
-                loss = loss_x + loss_y
-
+                loss = self.compute_loss(x_start, x_t, t)
                 loss.backward()
                 optimizer.step()
                 
@@ -132,9 +121,46 @@ class SwissRollDiffusion():
             q_cum_mats.append(cumulative_mat)
         return torch.stack(q_cum_mats)
 
-    def q_posterior_logits(self, x_t, t, x_start, x_start_logits=False):
+    def q_sample(self, x_start, t, noise):
+        """Sample from q(x_t | x_start) (i.e. add noise to the data).
+
+        Args:
+            x_start: jnp.ndarray: original clean data, in integer form (not onehot).
+                shape = (bs, ...).
+            t: :jnp.ndarray: timestep of the diffusion process, shape (bs,).
+            noise: jnp.ndarray: uniform noise on [0, 1) used to sample noisy data.
+                Should be of shape (*x_start.shape, num_pixel_vals).
+
+        Returns:
+            sample: jnp.ndarray: same shape as x_start. noisy data.
+        """
+        assert noise.shape == x_start.shape + (self.n_states + 1,)
+        logits = np.log(self.q_probs(x_start, t) + self.eps)
+
+        # To avoid numerical issues clip the noise to a minimum value
+        noise = np.clip(noise, a_min=np.finfo(noise.dtype).tiny, a_max=1.)
+        gumbel_noise = - np.log(-np.log(noise))
+        return np.argmax(logits + gumbel_noise, axis=-1)
+
+    def q_probs(self, x_start, t):
+        """Compute probabilities of q(x_t | x_start).
+
+        Args:
+            x_start: jnp.ndarray: jax array of shape (bs, ...) of int32 or int64 type.
+                Should not be of one hot representation, but have integer values
+                representing the class values.
+            t: jnp.ndarray: jax array of shape (bs,).
+
+        Returns:
+            probs: jnp.ndarray: jax array, shape (bs, x_start.shape[1:],
+                                                    num_pixel_vals).
+        """
+        return self.q_cum_mats[t, x_start]
+
+    def q_posterior_logits(self, x_t, t, x_start, x_start_logits):
         """
         TODO: fix indexing of x_t (needs to be int or long)
+        TODO: make sure that fact2 is correct (not using _at_onehot?)
         Compute the logits of q(x_{t-1} | x_t, x_start).
 
         Regarding x_start, we can either be passed the true onehot vector or the logits predicted from the model.
@@ -179,6 +205,23 @@ class SwissRollDiffusion():
         out = torch.log(fact1 + self.eps) + torch.log(fact2 + self.eps)
         t_broadcast = t.unsqueeze(1).expand_as(out)
         return torch.where(t_broadcast == 0, tzero_logits, out)
+
+    def p_logits(self, x, t):
+        """Compute logits of p(x_{t-1} | x_t)."""
+        assert t.shape == (x.shape[0],)
+        pred_logits = self.model(x, t)
+
+        # Predict the logits of p(x_{t-1}|x_t) by parameterizing this distribution
+        # as ~ sum_{pred_x_start} q(x_{t-1}, x_t |pred_x_start)p(pred_x_start|x_t)
+        t_broadcast = np.expand_dims(t, tuple(range(1, pred_logits.ndim)))
+        pred_logits = np.where(t_broadcast == 0,
+                                pred_logits,
+                                self.q_posterior_logits(pred_logits, x,
+                                                        t, x_start_logits=True)
+                                )
+
+        assert (pred_logits.shape == x.shape + (self.n_states + 1,))
+        return pred_logits
 
     def compute_loss(self, x_start, x_t, t):
         true_logits = self.q_posterior_logits(x_start, x_t, t, x_start_logits=False)
