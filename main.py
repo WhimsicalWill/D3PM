@@ -3,15 +3,19 @@ import torch.utils.data as data
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import matplotlib.pyplot as plt
 from sklearn.datasets import make_swiss_roll
 import numpy as np
-from plotting import plot_swiss_roll, plot_noising_process
+from plotting import visualize_reverse_noising_process
 import utils
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class NoisySwissRollDataset(data.Dataset):
     def __init__(self, betas, n_schedule_steps, n_states):
-        self.n_samples = 10000
+        self.n_samples = 500_000
         self.betas = betas
         self.n_schedule_steps = n_schedule_steps
         self.n_states = n_states
@@ -63,9 +67,8 @@ class DiffusionModel(nn.Module):
 
 class SwissRollDiffusion():
     def __init__(self):
-        self.n_samples = 500  # number of samples for swiss roll dataset
         self.n_schedule_steps = 100  # number of steps for the diffusion process
-        self.n_epochs = 20  # number of epochs for training
+        self.n_epochs = 1  # number of epochs for training
         self.n_states = 256  # number of states for the swiss roll data
         self.n_features = 2  # number of features (e.g. x and y coordinate)
         self.absorbing_idx = self.n_states  # index of the absorbing state
@@ -77,32 +80,45 @@ class SwissRollDiffusion():
         # Initialize the one-step and cumulative transition matrices
         self.q_one_step_mats = self.init_transition_matrices()
         self.q_cum_mats = self.init_cum_transition_matrices()
-        self.model = DiffusionModel(self.n_features, self.n_states, self.n_schedule_steps)
+        self.model = DiffusionModel(self.n_features, self.n_states, self.n_schedule_steps).to(device)
+
 
     def train(self):
         optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
         self.model.train()
+
+        # Initialize lists or logging mechanism for loss components
+        log_kl = []
+        log_nll = []
         
         for epoch in range(self.n_epochs):
             for i, x_start in enumerate(self.dataset_loader):
                 # x_start has shape (B, F)
-                noise = torch.rand(x_start.shape + (self.n_states + 1,))  # (B, F, D + 1)
-                t = torch.randint(0, self.n_schedule_steps, (x_start.shape[0],))  # (B,)
-                x_t = self.q_sample(x_start, t, noise)  # (B, F)
+
+                x_start = x_start.to(device)
+                noise = torch.rand(x_start.shape + (self.n_states + 1,)).to(device)  # (B, F, D + 1)
+                t = torch.randint(0, self.n_schedule_steps, (x_start.shape[0],)).to(device)  # (B,)
+                x_t = self.q_sample(x_start, t, noise).to(device) # (B, F)
 
                 optimizer.zero_grad()
-                loss = self.compute_loss(x_start, x_t, t)
-                loss.backward()
+                total_loss, kl_loss, nll_loss = self.compute_loss(x_start, x_t, t)
+                total_loss.backward()
                 optimizer.step()
+
+                # Log loss components for each step or periodically
+                log_kl.append(kl_loss.item())
+                log_nll.append(nll_loss.item())
                 
-                print(f"Epoch [{epoch+1}/{self.n_epochs}], Step [{i+1}/{len(self.dataset_loader)}], Loss: {loss.item():.4f}")
+                # Print detailed loss information periodically
+                if i % 50 == 0:  # Adjust the frequency as needed
+                    print(f"Epoch {epoch+1}, Step {i+1}, Total Loss: {total_loss.item():.4f}, KL: {kl_loss.item():.4f}, NLL: {nll_loss.item():.4f}")
 
     def init_transition_matrices(self):
         """Initialize transition matrices with an absorbing state."""
         # Set values directly to avoid numerical error with betas
         transition_matrices = []
         for beta in self.betas:
-            matrix = torch.zeros((self.n_states + 1, self.n_states + 1))  # +1 for absorbing state
+            matrix = torch.zeros((self.n_states + 1, self.n_states + 1), device=device)
             matrix.fill_diagonal_(1 - beta)
             matrix[:, self.absorbing_idx] = beta
             matrix[self.absorbing_idx, self.absorbing_idx] = 1
@@ -130,12 +146,12 @@ class SwissRollDiffusion():
             sample: jnp.ndarray: same shape as x_start. noisy data.
         """
         assert noise.shape == x_start.shape + (self.n_states + 1,)
-        logits = np.log(self.q_probs(x_start, t) + self.eps)
+        logits = torch.log(self.q_probs(x_start, t) + self.eps)
 
         # To avoid numerical issues clip the noise to a minimum value
-        noise = np.clip(noise, a_min=1e-6, a_max=1.)
-        gumbel_noise = - np.log(-np.log(noise))
-        return np.argmax(logits + gumbel_noise, axis=-1)
+        noise = torch.clamp(noise, min=1e-6, max=1.)
+        gumbel_noise = - torch.log(-torch.log(noise))
+        return torch.argmax(logits + gumbel_noise, axis=-1)
 
     def q_probs(self, x_start, t):
         """Compute probabilities of q(x_t | x_start).
@@ -154,8 +170,6 @@ class SwissRollDiffusion():
 
     def q_posterior_logits(self, x_start, x_t, t, x_start_logits):
         """
-        TODO: fix indexing of x_t (needs to be int or long)
-        TODO: make sure that fact2 is correct (not using _at_onehot?)
         Compute the logits of q(x_{t-1} | x_t, x_start).
 
         Regarding x_start, we can either be passed the true onehot vector or the logits predicted from the model.
@@ -198,6 +212,9 @@ class SwissRollDiffusion():
         # fact1 = self.q_one_step_mats.transpose(0, 2, 1)[t, x_t]  # (B, D + 1)
         fact1 = self._at(torch.transpose(self.q_one_step_mats, 2, 1), t, x_t)  # (B, F, D + 1)
 
+        print(f"fact1: {fact1[0][0][:]}")
+        print(f"fact2: {fact2[0][0][:]}")
+
         out = torch.log(fact1 + self.eps) + torch.log(fact2 + self.eps)
         t_broadcast = t.unsqueeze(1).unsqueeze(2).expand(-1, *out.shape[1:])
         return torch.where(t_broadcast == 0, tzero_logits, out)
@@ -206,6 +223,9 @@ class SwissRollDiffusion():
         """Compute logits of p(x_{t-1} | x_t)."""
         assert t.shape == (x.shape[0],)
         pred_logits = self.model(x, t)  # (B, F, D + 1)
+
+        # print(f"Before prediction: x0 = {x[0][0]}")
+        # print(f"After1 prediction: x0 = {pred_logits[0][0][:5]}")
 
         # Predict the logits of p(x_{t-1}|x_t) by parameterizing this distribution
         # as ~ sum_{pred_x_start} q(x_{t-1}, x_t |pred_x_start)p(pred_x_start|x_t)
@@ -216,6 +236,8 @@ class SwissRollDiffusion():
                                 self.q_posterior_logits(pred_logits, x,
                                                         t, x_start_logits=True)
                                 )
+
+        # print(f"After2 prediction: x0 = {pred_logits[0][0][:5]}")
 
         assert pred_logits.shape == x.shape + (self.n_states + 1,)
         return pred_logits
@@ -230,18 +252,18 @@ class SwissRollDiffusion():
         """
         assert x_start.shape == x_t.shape, f"Shapes do not match: {x_start.shape}, {x_t.shape}"
         true_logits = self.q_posterior_logits(x_start, x_t, t, x_start_logits=False)
-        pred_logits = self.p_logits(x=x_t, t=t)
+        pred_logits = self.p_logits(x_t, t)
 
         kl = utils.categorical_kl_logits(logits1=true_logits, logits2=pred_logits)
         assert kl.shape == x_start.shape
-        kl = utils.meanflat(kl) / np.log(2.)  # (B,)
+        kl = utils.meanflat(kl) / torch.log(torch.tensor(2.0))  # (B,)
 
         decoder_nll = -utils.categorical_log_likelihood(x_start, pred_logits)
         assert decoder_nll.shape == x_start.shape
-        decoder_nll = utils.meanflat(decoder_nll) / np.log(2.)  # (B,)
+        decoder_nll = utils.meanflat(decoder_nll) / torch.log(torch.tensor(2.0))  # (B,)
 
-        loss = torch.where(t == 0, decoder_nll, kl)  # (B,)
-        return loss.mean()  # scalar
+        total_loss = torch.where(t == 0, decoder_nll, kl).mean()
+        return total_loss, kl.mean(), decoder_nll.mean()
 
     def _at(self, a, t, x):
         """Extract coefficients at specified timesteps t and conditioning data x.
@@ -256,17 +278,69 @@ class SwissRollDiffusion():
         Returns:
         a[t, x]: jnp.ndarray: Jax array.
         """
-        t_broadcast = np.expand_dims(t, tuple(range(1, x.ndim)))
+        # t_broadcast = np.expand_dims(t, tuple(range(1, x.ndim)))
+        t_broadcast = t.unsqueeze(1).expand(-1, *x.shape[1:])
         return a[t_broadcast, x]
 
-    def visualize_noising_process(self):
-        dataset = NoisySwissRollDataset(self.betas, self.n_schedule_steps, self.n_states)
-        vis_steps = 5  # Number of visualization steps
-        colors = np.arctan2(data[:, 0], data[:, 1]) / self.n_states  # use original data for coloring
-        plot_noising_process(dataset, vis_steps, colors, self.n_states, self.n_schedule_steps)
+    def p_sample(self, x, t):
+        """Sample one timestep from the model p(x_{t-1} | x_t) using PyTorch."""
+        # Compute the logits for the current state x at time t
+        pred_logits = self.p_logits(x, t)  # Assuming p_logits returns logits of shape (batch_size, num_features, num_states + 1)
+
+        # print the last 5 logits of the x coordinate for x0
+        # print(pred_logits[0][0][-5:])
+
+        # create a mask to handle the no-noise condition when t == 0
+        nonzero_mask = (t > 0).float().unsqueeze(-1).unsqueeze(-1)  # reshape to (batch_size, 1, 1) for broadcasting
+
+        # use the straight-through gumbel-softmax estimator for sampling
+        gumbel_noise = -torch.log(-torch.log(torch.rand_like(pred_logits)))  # gumbel noise
+
+        # for t == 0, use argmax; otherwise, apply gumbel noise
+        # sampled_logits = torch.where(nonzero_mask.expand_as(pred_logits) > 0, pred_logits + gumbel_noise, pred_logits)
+        sampled_logits = torch.where(nonzero_mask.expand_as(pred_logits) > 0, pred_logits + gumbel_noise, pred_logits + gumbel_noise)
+        sample = torch.argmax(sampled_logits, dim=-1)
+
+        return sample
+
+    def sample_reverse(self, num_samples=128, vis_steps=5):
+        """Perform reverse sampling to generate data from the model."""
+        device = next(self.model.parameters()).device  # Get the device model is on
+
+        # Initialize x with the absorbing state for all features
+        x = torch.full((num_samples, self.n_features), self.absorbing_idx, dtype=torch.long, device=device)
+
+        snapshots = []
+        step_indices = np.linspace(0, self.n_schedule_steps, num=vis_steps, endpoint=False, dtype=int)
+
+        # Iterate over timesteps backwards from T-1 to 0
+        for t in reversed(range(self.n_schedule_steps)):
+            t_tensor = torch.full((num_samples,), t, dtype=torch.long, device=device)
+
+            # Sample the previous state given the current state x at time t
+            x = self.p_sample(x, t_tensor)  # Update x for each timestep
+            # print(f"timestep={t}, x0 = {x[0]}")
+
+            if t in step_indices:
+                snapshots.append(x.clone().detach())  # Clone and detach to avoid modifications
+
+        return snapshots
+
+    def visualize_samples(self, samples):
+        """Visualize generated samples."""
+        x, y = samples[:, 0].numpy(), samples[:, 1].numpy()
+        plt.scatter(x, y, alpha=0.5)
+        plt.title('Reverse Diffusion Generated Swiss Roll')
+        plt.xlabel('X coordinate')
+        plt.ylabel('Y coordinate')
+        plt.show()
 
 
 if __name__ == "__main__":
     swiss_roll_diffusion = SwissRollDiffusion()
     swiss_roll_diffusion.train()
     # swiss_roll_diffusion.visualize_noising_process()
+
+    # Sample new data points
+    snapshots = swiss_roll_diffusion.sample_reverse(num_samples=500, vis_steps=5)
+    visualize_reverse_noising_process(snapshots, swiss_roll_diffusion.n_states, swiss_roll_diffusion.n_schedule_steps)
