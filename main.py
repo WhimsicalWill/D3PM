@@ -15,7 +15,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class SwissRollDataset(data.Dataset):
     def __init__(self, betas, n_schedule_steps, n_states):
-        self.n_samples = 5_000_000
+        self.n_samples = 2_000_000
         self.betas = betas
         self.n_schedule_steps = n_schedule_steps
         self.n_states = n_states
@@ -188,23 +188,6 @@ class SwissRollDiffusion():
         Returns:
             logits: Tensor of shape (batch_size, n_states + 1) representing the logits of the posterior distribution.
         """
-        # if x_start_logits:
-        #     assert x_start.shape == x_t.shape + (self.n_states + 1,)
-        #     # x_start is logits, convert to probabilities for computation
-        #     x_start_probs = F.softmax(x_start, dim=-1)  # (B, D + 1), D = n_states
-        #     # self.q_cum_mats[t-1]  (D + 1, D + 1)
-        #     # x @ Q = (Q @ x^T)^T  (D + 1, B) ^ T = (B, D + 1)
-        #     # fact2 = torch.matmul(self.q_cum_mats[t-1], x_start_probs.transpose(0, 1)).transpose(0, 1)
-        #     fact2 = torch.matmul(x_start_probs, self.q_cum_mats[t-1])
-        #     tzero_logits = x_start  # Directly use logits if x_start is logits
-        # else:
-        #     assert x_start.shape == x_t.shape, f"Shapes do not match: {x_start.shape}, {x_t.shape}"
-        #     # x_start is indices, convert to one-hot for computation
-        #     x_start_one_hot = F.one_hot(x_start, num_classes=self.n_states + 1)  # (B, D + 1)
-        #     # fact2 = torch.matmul(self.q_cum_mats[t-1], x_start_one_hot.float().transpose(0, 1)).transpose(0, 1)
-        #     fact2 = torch.matmul(x_start_one_hot.float(), self.q_cum_mats[t-1])  # (128, 2, 257) @ (128, 257, 257) = (128, 2, 257)
-        #     tzero_logits = torch.log(x_start_one_hot.float() + self.eps)  # Convert one-hot to log probabilities
-
         if x_start_logits:
             assert x_start.shape == x_t.shape + (self.n_states + 1,)
             fact2 = self._at_onehot(self.q_cum_mats, t-1, F.softmax(x_start, dim=-1))
@@ -238,6 +221,20 @@ class SwissRollDiffusion():
         assert pred_logits.shape == x.shape + (self.n_states + 1,)
         return pred_logits
 
+    def prior_bpd(self, x_start, t):
+        """ Calculate the KL divergence from q(x_{T-1}|x_start) to the prior distribution.
+        The prior distribution here is expected to be concentrated on the absorbing state
+        for the last timestep.
+        """
+        q_probs = self.q_probs(x_start, t)
+
+        # Create a distribution that is a delta at the absorbing state
+        absorbing_probs = torch.zeros_like(q_probs)
+        absorbing_probs[:, :, self.absorbing_idx] = 1
+
+        kl_prior = F.kl_div(input=torch.log(q_probs + self.eps), target=absorbing_probs, reduction='batchmean')
+        return kl_prior
+
     def compute_loss(self, x_start, x_t, t):
         """Computes the loss using KL divergence between the true and predicted distributions.
         
@@ -258,7 +255,16 @@ class SwissRollDiffusion():
         assert decoder_nll.shape == x_start.shape
         decoder_nll = utils.meanflat(decoder_nll) / torch.log(torch.tensor(2.0))  # (B,)
 
-        total_loss = torch.where(t == 0, decoder_nll, kl).mean()
+         # KL divergence to prior is calculated at the final timestep
+        kl_prior = torch.tensor(0.0).to(device)
+        if t.max() == self.n_schedule_steps - 1:  # Check if we are at the final timestep in any batch element
+            kl_prior = self.prior_bpd(x_start, t)
+
+        # Incorporate the absorbing state KL divergence as prior_bpd
+        kl_prior = self.prior_bpd(x_start, t)
+
+        # Combine the losses
+        total_loss = torch.where(t == 0, decoder_nll, kl + kl_prior).mean()
         return total_loss, kl.mean(), decoder_nll.mean()
 
     def _at(self, a, t, x):
